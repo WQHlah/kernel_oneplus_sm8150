@@ -142,7 +142,7 @@ static const int bbr_min_tso_rate = 1200000;
  * lower than the estimated bandwidth. This is an important aspect of the
  * design.
  */
-static const int bbr_pacing_margin_percent = 1;
+static const int bbr_pacing_margin_percent = 0;
 
 /* We use a high_gain value of 2/ln(2) because it's the smallest pacing gain
  * that will allow a smoothly increasing pacing rate that will double each RTT
