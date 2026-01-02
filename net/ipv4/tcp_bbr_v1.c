@@ -136,14 +136,6 @@ static const u32 bbr_probe_rtt_mode_ms = 200;
 /* Skip TSO below the following bandwidth (bits/sec): */
 static const int bbr_min_tso_rate = 1200000;
 
-/* Pace at ~1% below estimated bw, on average, to reduce queue at bottleneck.
- * In order to help drive the network toward lower queues and low latency while
- * maintaining high utilization, the average pacing rate aims to be slightly
- * lower than the estimated bandwidth. This is an important aspect of the
- * design.
- */
-static const int bbr_pacing_margin_percent = 1;
-
 /* We use a high_gain value of 2/ln(2) because it's the smallest pacing gain
  * that will allow a smoothly increasing pacing rate that will double each RTT
  * and send the same number of packets per RTT that an un-paced, slow-starting
@@ -243,15 +235,17 @@ static u64 bbr_rate_bytes_per_sec(struct sock *sk, u64 rate, int gain)
 {
 	unsigned int mss = tcp_sk(sk)->mss_cache;
 
+	if (!tcp_needs_internal_pacing(sk))
+		mss = tcp_mss_to_mtu(sk, mss);
 	rate *= mss;
 	rate *= gain;
 	rate >>= BBR_SCALE;
-	rate *= USEC_PER_SEC / 100 * (100 - bbr_pacing_margin_percent);
+	rate *= USEC_PER_SEC;
 	return rate >> BW_SCALE;
 }
 
 /* Convert a BBR bw and gain factor to a pacing rate in bytes per second. */
-static unsigned long bbr_bw_to_pacing_rate(struct sock *sk, u32 bw, int gain)
+static u32 bbr_bw_to_pacing_rate(struct sock *sk, u32 bw, int gain)
 {
 	u64 rate = bw;
 
@@ -279,12 +273,18 @@ static void bbr_init_pacing_rate_from_rtt(struct sock *sk)
 	sk->sk_pacing_rate = bbr_bw_to_pacing_rate(sk, bw, bbr_high_gain);
 }
 
-/* Pace using current bw estimate and a gain factor. */
+/* Pace using current bw estimate and a gain factor. In order to help drive the
+ * network toward lower queues while maintaining high utilization and low
+ * latency, the average pacing rate aims to be slightly (~1%) lower than the
+ * estimated bandwidth. This is an important aspect of the design. In this
+ * implementation this slightly lower pacing rate is achieved implicitly by not
+ * including link-layer headers in the packet size used for the pacing rate.
+ */
 static void bbr_set_pacing_rate(struct sock *sk, u32 bw, int gain)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = inet_csk_ca(sk);
-	unsigned long rate = bbr_bw_to_pacing_rate(sk, bw, gain);
+	u32 rate = bbr_bw_to_pacing_rate(sk, bw, gain);
 
 	if (unlikely(!bbr->has_seen_rtt && tp->srtt_us))
 		bbr_init_pacing_rate_from_rtt(sk);
@@ -306,7 +306,7 @@ static u32 bbr_tso_segs_goal(struct sock *sk)
 	/* Sort of tcp_tso_autosize() but ignoring
 	 * driver provided sk_gso_max_size.
 	 */
-	bytes = min_t(unsigned long, sk->sk_pacing_rate >> sk->sk_pacing_shift,
+	bytes = min_t(u32, sk->sk_pacing_rate >> sk->sk_pacing_shift,
 		      GSO_MAX_SIZE - 1 - MAX_TCP_HEADER);
 	segs = max_t(u32, bytes / tp->mss_cache, bbr_min_tso_segs(sk));
 
@@ -414,39 +414,6 @@ static u32 bbr_inflight(struct sock *sk, u32 bw, int gain)
 	inflight = bbr_quantization_budget(sk, inflight);
 
 	return inflight;
-}
-
-/* With pacing at lower layers, there's often less data "in the network" than
- * "in flight". With TSQ and departure time pacing at lower layers (e.g. fq),
- * we often have several skbs queued in the pacing layer with a pre-scheduled
- * earliest departure time (EDT). BBR adapts its pacing rate based on the
- * inflight level that it estimates has already been "baked in" by previous
- * departure time decisions. We calculate a rough estimate of the number of our
- * packets that might be in the network at the earliest departure time for the
- * next skb scheduled:
- *   in_network_at_edt = inflight_at_edt - (EDT - now) * bw
- * If we're increasing inflight, then we want to know if the transmit of the
- * EDT skb will push inflight above the target, so inflight_at_edt includes
- * bbr_tso_segs_goal() from the skb departing at EDT. If decreasing inflight,
- * then estimate if inflight will sink too low just before the EDT transmit.
- */
-static u32 bbr_packets_in_net_at_edt(struct sock *sk, u32 inflight_now)
-{
-	struct tcp_sock *tp = tcp_sk(sk);
-	struct bbr *bbr = inet_csk_ca(sk);
-	u64 now_ns, edt_ns, interval_us;
-	u32 interval_delivered, inflight_at_edt;
-
-	now_ns = tp->tcp_clock_cache;
-	edt_ns = max(tp->tcp_wstamp_ns, now_ns);
-	interval_us = div_u64(edt_ns - now_ns, NSEC_PER_USEC);
-	interval_delivered = (u64)bbr_bw(sk) * interval_us >> BW_SCALE;
-	inflight_at_edt = inflight_now;
-	if (bbr->pacing_gain > BBR_UNIT)              /* increasing inflight */
-		inflight_at_edt += bbr_tso_segs_goal(sk);  /* include EDT skb */
-	if (interval_delivered >= inflight_at_edt)
-		return 0;
-	return inflight_at_edt - interval_delivered;
 }
 
 /* Find the cwnd increment based on estimate of ack aggregation */
@@ -563,7 +530,7 @@ static bool bbr_is_next_cycle_phase(struct sock *sk,
 	if (bbr->pacing_gain == BBR_UNIT)
 		return is_full_length;		/* just use wall clock time */
 
-	inflight = bbr_packets_in_net_at_edt(sk, rs->prior_in_flight);
+	inflight = rs->prior_in_flight;  /* what was in-flight before ACK? */
 	bw = bbr_max_bw(sk);
 
 	/* A pacing_gain > 1.0 probes for bw by trying to raise inflight to at
@@ -778,8 +745,7 @@ static void bbr_update_bw(struct sock *sk, const struct rate_sample *rs)
 	 * bandwidth sample. Delivered is in packets and interval_us in uS and
 	 * ratio will be <<1 for most connections. So delivered is first scaled.
 	 */
-	bw = (u64)rs->delivered * BW_UNIT;
-	do_div(bw, rs->interval_us);
+	bw = div64_long((u64)rs->delivered * BW_UNIT, rs->interval_us);
 
 	/* If this sample is application-limited, it is likely to have a very
 	 * low delivered count that represents application behavior rather than
@@ -897,7 +863,7 @@ static void bbr_check_drain(struct sock *sk, const struct rate_sample *rs)
 				bbr_inflight(sk, bbr_max_bw(sk), BBR_UNIT);
 	}	/* fall through to check if in-flight is already small: */
 	if (bbr->mode == BBR_DRAIN &&
-	    bbr_packets_in_net_at_edt(sk, tcp_packets_in_flight(tcp_sk(sk))) <=
+	    tcp_packets_in_flight(tcp_sk(sk)) <=
 	    bbr_inflight(sk, bbr_max_bw(sk), BBR_UNIT))
 		bbr_reset_probe_bw_mode(sk);  /* we estimate queue is drained */
 }
@@ -945,7 +911,7 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 	filter_expired = after(tcp_jiffies32,
 			       bbr->min_rtt_stamp + bbr_min_rtt_win_sec * HZ);
 	if (rs->rtt_us >= 0 &&
-	    (rs->rtt_us <= bbr->min_rtt_us ||
+	    (rs->rtt_us < bbr->min_rtt_us ||
 	     (filter_expired && !rs->is_ack_delayed))) {
 		bbr->min_rtt_us = rs->rtt_us;
 		bbr->min_rtt_stamp = tcp_jiffies32;
@@ -1041,7 +1007,7 @@ static void bbr_init(struct sock *sk)
 	bbr->prior_cwnd = 0;
 	tp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
 	bbr->rtt_cnt = 0;
-	bbr->next_rtt_delivered = 0;
+	bbr->next_rtt_delivered = tp->delivered;
 	bbr->prev_ca_state = TCP_CA_Open;
 	bbr->packet_conservation = 0;
 
